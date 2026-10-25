@@ -1,0 +1,1789 @@
+name: Build ClientCapes v2 (Fabric 1.21.11 + Server)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.1
+
+      - name: Resolve Fabric versions and write project files
+        run: |
+          set -e
+          MC=1.21.11
+          YARN=$(curl -s https://meta.fabricmc.net/v2/versions/yarn/$MC | jq -r '.[0].version')
+          LOADER=$(curl -s https://meta.fabricmc.net/v2/versions/loader | jq -r '[.[] | select(.stable==true)][0].version')
+          API=$(curl -s https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml | grep -o "<version>[^<]*+$MC</version>" | sed 's/<[^>]*>//g' | tail -1)
+          echo "MC=$MC YARN=$YARN LOADER=$LOADER API=$API"
+          if [ -z "$YARN" ] || [ -z "$LOADER" ] || [ -z "$API" ]; then echo "Gagal mengambil versi Fabric"; exit 1; fi
+
+          # ---------------- SERVER (Python 3, tanpa dependensi) ----------------
+          cat > cape_server.py <<'EOF'
+          #!/usr/bin/env python3
+          """ClientCapes server: menyimpan cape PNG per UUID pemain.
+
+          Jalankan:  CAPE_KEY=rahasia PORT=8080 python3 cape_server.py
+          Env:
+            PORT       port HTTP (default 8080)
+            CAPE_KEY   kunci bersama; kosong = tidak ada kunci
+            CAPE_DATA  folder penyimpanan (default ./capes)
+          """
+          import hashlib
+          import hmac
+          import json
+          import os
+          import re
+          import struct
+          import sys
+          import threading
+          import time
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          PORT = int(os.environ.get("PORT", "8080"))
+          KEY = os.environ.get("CAPE_KEY", "")
+          DATA = os.environ.get("CAPE_DATA", "capes")
+          MAX_BYTES = 1_000_000
+          os.makedirs(DATA, exist_ok=True)
+          TOKENS_FILE = os.path.join(DATA, "tokens.json")
+          LOCK = threading.Lock()
+          UUID_RE = re.compile(r"^[0-9a-f]{32}$")
+          RATE = {}
+
+
+          def load_tokens():
+              try:
+                  with open(TOKENS_FILE, "r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return {}
+
+
+          def save_tokens(t):
+              tmp = TOKENS_FILE + ".tmp"
+              with open(tmp, "w", encoding="utf-8") as f:
+                  json.dump(t, f)
+              os.replace(tmp, TOKENS_FILE)
+
+
+          def norm(u):
+              u = u.replace("-", "").lower()
+              return u if UUID_RE.match(u) else None
+
+
+          def png_ok(b):
+              if len(b) < 33 or b[:8] != b"\x89PNG\r\n\x1a\n" or b[12:16] != b"IHDR":
+                  return False
+              w, h = struct.unpack(">II", b[16:24])
+              return 64 <= w <= 2048 and w * 32 == h * 64
+
+
+          def rate_ok(ip):
+              now = time.time()
+              lst = [t for t in RATE.get(ip, []) if now - t < 60]
+              if len(lst) >= 30:
+                  RATE[ip] = lst
+                  return False
+              lst.append(now)
+              RATE[ip] = lst
+              return True
+
+
+          class Handler(BaseHTTPRequestHandler):
+              server_version = "ClientCapes/1.0"
+
+              def log_message(self, fmt, *args):
+                  sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+              def _send(self, code, body=b"", ctype="text/plain; charset=utf-8", headers=None):
+                  self.send_response(code)
+                  self.send_header("Content-Type", ctype)
+                  self.send_header("Content-Length", str(len(body)))
+                  for k, v in (headers or {}).items():
+                      self.send_header(k, v)
+                  self.end_headers()
+                  if body:
+                      self.wfile.write(body)
+
+              def _uuid(self):
+                  m = re.match(r"^/cape/([0-9a-fA-F-]{32,36})$", self.path.split("?")[0])
+                  return norm(m.group(1)) if m else None
+
+              def _auth(self, u):
+                  if KEY and not hmac.compare_digest(self.headers.get("X-Key", ""), KEY):
+                      self._send(403, b"kunci salah")
+                      return False
+                  tok = self.headers.get("X-Token", "")
+                  if len(tok) < 16 or len(tok) > 128:
+                      self._send(400, b"token tidak valid")
+                      return False
+                  h = hashlib.sha256(tok.encode()).hexdigest()
+                  with LOCK:
+                      t = load_tokens()
+                      cur = t.get(u)
+                      if cur is None:
+                          t[u] = h
+                          save_tokens(t)
+                          return True
+                      if hmac.compare_digest(cur, h):
+                          return True
+                  self._send(403, b"UUID ini sudah diklaim token lain")
+                  return False
+
+              def do_GET(self):
+                  path = self.path.split("?")[0]
+                  if path in ("/", "/health"):
+                      return self._send(200, b"ClientCapes server OK\n")
+                  u = self._uuid()
+                  if not u:
+                      return self._send(404, b"not found")
+                  try:
+                      with open(os.path.join(DATA, u + ".png"), "rb") as f:
+                          data = f.read()
+                  except OSError:
+                      return self._send(404, b"no cape")
+                  etag = '"%s"' % hashlib.sha1(data).hexdigest()
+                  if self.headers.get("If-None-Match") == etag:
+                      return self._send(304, b"", headers={"ETag": etag})
+                  self._send(200, data, "image/png", {"ETag": etag, "Cache-Control": "no-cache"})
+
+              def do_PUT(self):
+                  u = self._uuid()
+                  if not u:
+                      return self._send(404, b"not found")
+                  if not rate_ok(self.client_address[0]):
+                      return self._send(429, b"terlalu sering")
+                  try:
+                      length = int(self.headers.get("Content-Length", "0"))
+                  except ValueError:
+                      length = 0
+                  if length <= 0 or length > MAX_BYTES:
+                      return self._send(413, b"ukuran file tidak valid (maks 1MB)")
+                  data = self.rfile.read(length)
+                  if not png_ok(data):
+                      return self._send(400, b"PNG tidak valid (harus rasio 2:1, min 64 lebar)")
+                  if not self._auth(u):
+                      return
+                  path = os.path.join(DATA, u + ".png")
+                  with LOCK:
+                      with open(path + ".tmp", "wb") as f:
+                          f.write(data)
+                      os.replace(path + ".tmp", path)
+                  self._send(200, b"ok")
+
+              def do_DELETE(self):
+                  u = self._uuid()
+                  if not u:
+                      return self._send(404, b"not found")
+                  if not rate_ok(self.client_address[0]):
+                      return self._send(429, b"terlalu sering")
+                  if not self._auth(u):
+                      return
+                  try:
+                      os.remove(os.path.join(DATA, u + ".png"))
+                  except OSError:
+                      pass
+                  self._send(200, b"ok")
+
+
+          if __name__ == "__main__":
+              print("ClientCapes server di port %d (kunci: %s)" % (PORT, "ya" if KEY else "tidak"))
+              ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+          EOF
+
+          # ---------------- MOD ----------------
+          mkdir -p mod && cd mod
+          mkdir -p src/main/java/com/example/clientcapes/mixin
+          mkdir -p src/main/resources/assets/clientcapes/lang
+
+          cat > gradle.properties <<EOF
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          minecraft_version=$MC
+          yarn_mappings=$YARN
+          loader_version=$LOADER
+          fabric_version=$API
+          mod_version=2.0.0
+          maven_group=com.example
+          archives_base_name=clientcapes
+          EOF
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'clientcapes'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+              it.options.encoding = 'UTF-8'
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "clientcapes",
+            "version": "${version}",
+            "name": "Client Capes",
+            "description": "Custom cape client mod with rotating preview, preset capes, custom PNG capes and optional shared-server sync.",
+            "authors": ["You"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.example.clientcapes.CapeMod"]
+            },
+            "mixins": ["clientcapes.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          cat > src/main/resources/clientcapes.mixins.json <<'EOF'
+          {
+            "required": false,
+            "minVersion": "0.8",
+            "package": "com.example.clientcapes.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "client": [
+              "PlayerSkinMixin"
+            ],
+            "injectors": {
+              "defaultRequire": 0
+            }
+          }
+          EOF
+
+          cat > src/main/resources/assets/clientcapes/lang/en_us.json <<'EOF'
+          {
+            "key.category.clientcapes.main": "Client Capes",
+            "key.clientcapes.open": "Open Cape Menu"
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientcapes/mixin/PlayerSkinMixin.java <<'EOF'
+          package com.example.clientcapes.mixin;
+
+          import com.example.clientcapes.CapeManager;
+          import net.minecraft.client.network.AbstractClientPlayerEntity;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          @Mixin(AbstractClientPlayerEntity.class)
+          public abstract class PlayerSkinMixin {
+              // Return type SkinTextures sengaja ditulis sebagai Object agar tidak bergantung pada nama class
+              @Inject(method = {"getSkinTextures", "getSkin"}, at = @At("RETURN"), cancellable = true, require = 0)
+              private void clientcapes$cape(CallbackInfoReturnable<Object> cir) {
+                  Object r = CapeManager.override(this, cir.getReturnValue());
+                  if (r != null) cir.setReturnValue(r);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientcapes/CapeConfig.java <<'EOF'
+          package com.example.clientcapes;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.security.SecureRandom;
+
+          public class CapeConfig {
+              /** "" = tidak ada, "preset:Nama", atau "file:nama.png" */
+              public String capeKey = "";
+              public boolean autoSpin = true;
+
+              /** Sinkronisasi lewat server bersama */
+              public String serverUrl = "";
+              public String serverKey = "";
+              public String token = "";
+              public boolean showOthers = true;
+              public boolean shareOwn = true;
+
+              private static CapeConfig INSTANCE = new CapeConfig();
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+              private static Path path() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("clientcapes.json");
+              }
+
+              public static CapeConfig get() {
+                  return INSTANCE;
+              }
+
+              public static void load() {
+                  try {
+                      Path p = path();
+                      if (Files.exists(p)) {
+                          CapeConfig c = GSON.fromJson(Files.readString(p), CapeConfig.class);
+                          if (c != null) {
+                              if (c.capeKey == null) c.capeKey = "";
+                              if (c.serverUrl == null) c.serverUrl = "";
+                              if (c.serverKey == null) c.serverKey = "";
+                              if (c.token == null) c.token = "";
+                              INSTANCE = c;
+                          }
+                      }
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+                  if (INSTANCE.token.isEmpty()) {
+                      byte[] b = new byte[16];
+                      new SecureRandom().nextBytes(b);
+                      StringBuilder sb = new StringBuilder();
+                      for (byte x : b) sb.append(String.format("%02x", x));
+                      INSTANCE.token = sb.toString();
+                      save();
+                  }
+              }
+
+              public static void save() {
+                  try {
+                      Files.writeString(path(), GSON.toJson(INSTANCE));
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientcapes/CapeMod.java <<'EOF'
+          package com.example.clientcapes;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.util.Identifier;
+          import org.lwjgl.glfw.GLFW;
+
+          public class CapeMod implements ClientModInitializer {
+              public static KeyBinding openKey;
+
+              @Override
+              public void onInitializeClient() {
+                  CapeConfig.load();
+
+                  KeyBinding.Category cat = KeyBinding.Category.create(Identifier.of("clientcapes", "main"));
+                  openKey = KeyBindingHelper.registerKeyBinding(
+                          new KeyBinding("key.clientcapes.open", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_G, cat));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+                      CapeSync.tick(mc);
+                      while (openKey.wasPressed()) {
+                          if (mc.currentScreen == null) mc.setScreen(new CapeScreen());
+                      }
+                  });
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientcapes/CapeData.java <<'EOF'
+          package com.example.clientcapes;
+
+          /** Tekstur cape dalam format kanvas 2:1 (64x32 atau kelipatannya), piksel ARGB. */
+          public class CapeData {
+              public final int w, h;
+              public final int[] px;
+              public final int avg;
+
+              public CapeData(int w, int h, int[] px) {
+                  this.w = w;
+                  this.h = h;
+                  this.px = px;
+                  this.avg = computeAvg(px);
+              }
+
+              public static int computeAvg(int[] px) {
+                  long r = 0, g = 0, b = 0, n = 0;
+                  for (int c : px) {
+                      if ((c >>> 24) < 128) continue;
+                      r += (c >> 16) & 255;
+                      g += (c >> 8) & 255;
+                      b += c & 255;
+                      n++;
+                  }
+                  if (n == 0) return 0xFF808080;
+                  return 0xFF000000 | ((int) (r / n) << 16) | ((int) (g / n) << 8) | (int) (b / n);
+              }
+
+              /** Ambil warna pada koordinat tekstur 64x32 (boleh pecahan). */
+              public int sample(double tx, double ty) {
+                  double s = w / 64.0;
+                  int x = (int) (tx * s), y = (int) (ty * s);
+                  if (x < 0) x = 0;
+                  if (y < 0) y = 0;
+                  if (x >= w) x = w - 1;
+                  if (y >= h) y = h - 1;
+                  return px[y * w + x];
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientcapes/Capes.java <<'EOF'
+          package com.example.clientcapes;
+
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.texture.NativeImage;
+
+          import java.io.ByteArrayInputStream;
+          import java.io.InputStream;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.stream.Stream;
+
+          public class Capes {
+              public record Entry(String key, String name, boolean custom) {
+              }
+
+              public static final String[] PRESETS = {
+                      "Merah", "Biru Laut", "Hijau Hutan", "Ungu Malam", "Emas",
+                      "Pelangi", "Catur", "Api", "Es"
+              };
+
+              private static final Map<String, CapeData> CACHE = new HashMap<>();
+
+              public static Path dir() {
+                  return FabricLoader.getInstance().getGameDir().resolve("clientcapes");
+              }
+
+              public static void clearCache() {
+                  CACHE.clear();
+                  CapeManager.invalidate();
+              }
+
+              public static List<Entry> entries() {
+                  List<Entry> l = new ArrayList<>();
+                  l.add(new Entry("", "Tanpa Cape", false));
+                  for (String p : PRESETS) l.add(new Entry("preset:" + p, p, false));
+                  try {
+                      Files.createDirectories(dir());
+                      try (Stream<Path> s = Files.list(dir())) {
+                          s.filter(f -> f.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".png"))
+                                  .sorted()
+                                  .forEach(f -> {
+                                      String n = f.getFileName().toString();
+                                      l.add(new Entry("file:" + n, n.substring(0, n.length() - 4), true));
+                                  });
+                      }
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+                  return l;
+              }
+
+              public static CapeData get(String key) {
+                  if (key == null || key.isEmpty()) return null;
+                  CapeData c = CACHE.get(key);
+                  if (c != null) return c;
+                  try {
+                      if (key.startsWith("preset:")) {
+                          String name = key.substring(7);
+                          for (int i = 0; i < PRESETS.length; i++) {
+                              if (PRESETS[i].equals(name)) {
+                                  c = preset(i);
+                                  break;
+                              }
+                          }
+                      } else if (key.startsWith("file:")) {
+                          c = fromFile(dir().resolve(key.substring(5)));
+                      }
+                  } catch (Throwable t) {
+                      t.printStackTrace();
+                  }
+                  if (c != null) CACHE.put(key, c);
+                  return c;
+              }
+
+              // ---------- baca / tulis gambar ----------
+
+              private static CapeData fromImage(NativeImage img) {
+                  int w = img.getWidth(), h = img.getHeight();
+                  if (w < 2 || h < 2 || w > 4096 || h > 4096) return null;
+                  int[] px = new int[w * h];
+                  for (int y = 0; y < h; y++) {
+                      for (int x = 0; x < w; x++) {
+                          px[y * w + x] = img.getColorArgb(x, y);
+                      }
+                  }
+                  return normalize(px, w, h);
+              }
+
+              private static CapeData fromFile(Path p) throws Exception {
+                  if (!Files.exists(p)) return null;
+                  try (InputStream in = Files.newInputStream(p)) {
+                      NativeImage img = NativeImage.read(in);
+                      try {
+                          return fromImage(img);
+                      } finally {
+                          img.close();
+                      }
+                  }
+              }
+
+              public static CapeData fromBytes(byte[] bytes) throws Exception {
+                  NativeImage img = NativeImage.read(new ByteArrayInputStream(bytes));
+                  try {
+                      return fromImage(img);
+                  } finally {
+                      img.close();
+                  }
+              }
+
+              public static byte[] toPng(CapeData d) throws Exception {
+                  NativeImage img = new NativeImage(NativeImage.Format.RGBA, d.w, d.h, false);
+                  Path tmp = null;
+                  try {
+                      for (int y = 0; y < d.h; y++) {
+                          for (int x = 0; x < d.w; x++) {
+                              img.setColorArgb(x, y, d.px[y * d.w + x]);
+                          }
+                      }
+                      tmp = Files.createTempFile("clientcapes", ".png");
+                      img.writeTo(tmp);
+                      return Files.readAllBytes(tmp);
+                  } finally {
+                      img.close();
+                      if (tmp != null) Files.deleteIfExists(tmp);
+                  }
+              }
+
+              // ---------- normalisasi ke layout cape ----------
+
+              private static void fillRect(int[] out, int W, int x0, int y0, int x1, int y1, int col) {
+                  for (int y = y0; y < y1; y++) {
+                      for (int x = x0; x < x1; x++) {
+                          out[y * W + x] = col;
+                      }
+                  }
+              }
+
+              private static int shade(int argb, double f) {
+                  int r = Math.min(255, (int) (((argb >> 16) & 255) * f));
+                  int g = Math.min(255, (int) (((argb >> 8) & 255) * f));
+                  int b = Math.min(255, (int) ((argb & 255) * f));
+                  return 0xFF000000 | (r << 16) | (g << 8) | b;
+              }
+
+              static CapeData normalize(int[] src, int sw, int sh) {
+                  // Sudah format cape/elytra 2:1 (mis. 64x32, 128x64)
+                  if (sw >= 64 && sw * 32 == sh * 64) return new CapeData(sw, sh, src);
+
+                  int avg = CapeData.computeAvg(src);
+                  int s, W, H;
+                  int[] out;
+
+                  if (sw * 17 == sh * 22 && sw % 22 == 0) {
+                      // Format OptiFine 22x17 (atau kelipatannya)
+                      s = sw / 22;
+                      W = 64 * s;
+                      H = 32 * s;
+                      out = new int[W * H];
+                      for (int y = 0; y < sh; y++) {
+                          for (int x = 0; x < sw; x++) {
+                              out[y * W + x] = src[y * sw + x];
+                          }
+                      }
+                  } else {
+                      // Gambar bebas: skala ke sisi luar cape (10x16)
+                      s = 8;
+                      W = 512;
+                      H = 256;
+                      out = new int[W * H];
+                      int fx = s, fy = s, fw = 10 * s, fh = 16 * s;
+                      for (int y = 0; y < fh; y++) {
+                          for (int x = 0; x < fw; x++) {
+                              int c = src[(y * sh / fh) * sw + (x * sw / fw)];
+                              if ((c >>> 24) < 128) c = avg;
+                              out[(fy + y) * W + fx + x] = c | 0xFF000000;
+                          }
+                      }
+                      fillRect(out, W, 12 * s, s, 22 * s, 17 * s, shade(avg, 0.7)); // sisi dalam
+                      fillRect(out, W, 0, s, s, 17 * s, shade(avg, 0.85));            // samping
+                      fillRect(out, W, 11 * s, s, 12 * s, 17 * s, shade(avg, 0.85));
+                      fillRect(out, W, s, 0, 11 * s, s, shade(avg, 0.85));            // atas
+                      fillRect(out, W, 11 * s, 0, 21 * s, s, shade(avg, 0.85));       // bawah
+                  }
+                  // Area elytra (22..46 x 0..22) diisi warna rata-rata supaya sayap tetap terlihat
+                  fillRect(out, W, 22 * s, 0, 46 * s, 22 * s, avg);
+                  return new CapeData(W, H, out);
+              }
+
+              // ---------- preset buatan kode ----------
+
+              private static int clamp(int v) {
+                  return v < 0 ? 0 : Math.min(v, 255);
+              }
+
+              private static int rgb(int r, int g, int b) {
+                  return 0xFF000000 | (clamp(r) << 16) | (clamp(g) << 8) | clamp(b);
+              }
+
+              private static int lerp(int a, int b, double t) {
+                  int r = (int) (((a >> 16) & 255) * (1 - t) + ((b >> 16) & 255) * t);
+                  int g = (int) (((a >> 8) & 255) * (1 - t) + ((b >> 8) & 255) * t);
+                  int bl = (int) ((a & 255) * (1 - t) + (b & 255) * t);
+                  return rgb(r, g, bl);
+              }
+
+              private static int hash(int x, int y) {
+                  int h = x * 374761393 + y * 668265263;
+                  h = (h ^ (h >>> 13)) * 1274126177;
+                  return (h ^ (h >>> 16)) & 0x7FFFFFFF;
+              }
+
+              private static int hsv(double h) {
+                  double r = 0, g = 0, b = 0;
+                  double x = h * 6;
+                  int i = ((int) Math.floor(x)) % 6;
+                  double f = x - Math.floor(x), q = 1 - f;
+                  switch (i) {
+                      case 0 -> {
+                          r = 1;
+                          g = f;
+                      }
+                      case 1 -> {
+                          r = q;
+                          g = 1;
+                      }
+                      case 2 -> {
+                          g = 1;
+                          b = f;
+                      }
+                      case 3 -> {
+                          g = q;
+                          b = 1;
+                      }
+                      case 4 -> {
+                          r = f;
+                          b = 1;
+                      }
+                      default -> {
+                          r = 1;
+                          b = q;
+                      }
+                  }
+                  return rgb((int) (r * 255), (int) (g * 255), (int) (b * 255));
+              }
+
+              private static int presetColor(int idx, double u, double v, int hx, int hy) {
+                  switch (idx) {
+                      case 0 -> {
+                          int c = rgb(200, 30, 40);
+                          if (Math.abs(u - 0.5) < 0.09) c = rgb(240, 200, 60);
+                          return c;
+                      }
+                      case 1 -> {
+                          return lerp(rgb(10, 40, 140), rgb(40, 200, 230), v);
+                      }
+                      case 2 -> {
+                          int c = lerp(rgb(20, 90, 30), rgb(60, 170, 70), v);
+                          if (((hx + hy) & 1) == 0) c = shade(c, 0.88);
+                          return c;
+                      }
+                      case 3 -> {
+                          int c = lerp(rgb(30, 10, 70), rgb(95, 35, 145), v);
+                          if (hash(hx, hy) % 19 == 0) c = rgb(255, 255, 210);
+                          return c;
+                      }
+                      case 4 -> {
+                          return ((int) (u * 10)) % 2 == 0 ? rgb(235, 195, 45) : rgb(190, 150, 20);
+                      }
+                      case 5 -> {
+                          return hsv(Math.min(0.999, u));
+                      }
+                      case 6 -> {
+                          return ((((int) (u * 8)) + ((int) (v * 12))) & 1) == 0 ? rgb(245, 245, 245) : rgb(25, 25, 25);
+                      }
+                      case 7 -> {
+                          return lerp(rgb(200, 20, 10), rgb(255, 225, 60), v);
+                      }
+                      default -> {
+                          int c = lerp(rgb(165, 215, 255), rgb(235, 248, 255), v);
+                          if (hash(hx, hy) % 17 == 0) c = rgb(255, 255, 255);
+                          return c;
+                      }
+                  }
+              }
+
+              private static CapeData preset(int idx) {
+                  int W = 64, H = 32;
+                  int[] px = new int[W * H];
+
+                  // Area cape: x 0..21, y 0..16
+                  for (int y = 0; y <= 16; y++) {
+                      for (int x = 0; x <= 21; x++) {
+                          boolean outer = x >= 1 && x <= 10;
+                          boolean inner = x >= 12 && x <= 21;
+                          double u = outer ? (x - 1 + 0.5) / 10.0 : inner ? (x - 12 + 0.5) / 10.0 : 0.5;
+                          double v = Math.max(0, Math.min(1, (y - 1 + 0.5) / 16.0));
+                          int c = presetColor(idx, u, v, x, y);
+                          if (outer && (u < 0.06 || u > 0.94 || v < 0.04 || v > 0.96)) c = shade(c, 0.78);
+                          if (inner) c = shade(c, 0.7);
+                          px[y * W + x] = c;
+                      }
+                  }
+                  // Area elytra: x 22..45, y 0..21
+                  for (int y = 0; y < 22; y++) {
+                      for (int x = 22; x < 46; x++) {
+                          double u = (x - 22 + 0.5) / 24.0;
+                          double v = (y + 0.5) / 22.0;
+                          int c = presetColor(idx, u, v, x, y);
+                          if (u < 0.05 || u > 0.95 || v < 0.04 || v > 0.96) c = shade(c, 0.8);
+                          px[y * W + x] = c;
+                      }
+                  }
+                  return new CapeData(W, H, px);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientcapes/CapeNet.java <<'EOF'
+          package com.example.clientcapes;
+
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URI;
+          import java.util.UUID;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.function.Consumer;
+
+          /** Komunikasi dengan server cape (HTTP sederhana, tanpa dependensi tambahan). */
+          public class CapeNet {
+              public record Result(int code, byte[] body, String etag) {
+              }
+
+              private interface Task {
+                  void run() throws Exception;
+              }
+
+              private static final ExecutorService POOL = Executors.newFixedThreadPool(2, r -> {
+                  Thread t = new Thread(r, "clientcapes-net");
+                  t.setDaemon(true);
+                  return t;
+              });
+
+              /** Status terakhir untuk ditampilkan di UI. */
+              public static volatile String status = "";
+
+              private static String base() {
+                  String u = CapeConfig.get().serverUrl == null ? "" : CapeConfig.get().serverUrl.trim();
+                  while (u.endsWith("/")) u = u.substring(0, u.length() - 1);
+                  return u;
+              }
+
+              public static boolean enabled() {
+                  return !base().isEmpty();
+              }
+
+              private static HttpURLConnection open(String path, String method) throws Exception {
+                  HttpURLConnection c = (HttpURLConnection) URI.create(base() + path).toURL().openConnection();
+                  c.setRequestMethod(method);
+                  c.setConnectTimeout(8000);
+                  c.setReadTimeout(15000);
+                  c.setRequestProperty("X-Key", CapeConfig.get().serverKey == null ? "" : CapeConfig.get().serverKey);
+                  c.setRequestProperty("X-Token", CapeConfig.get().token);
+                  return c;
+              }
+
+              private static String readSmall(InputStream in) {
+                  if (in == null) return "";
+                  try (in) {
+                      byte[] b = in.readNBytes(200);
+                      return new String(b);
+                  } catch (Exception e) {
+                      return "";
+                  }
+              }
+
+              private static void async(Task t) {
+                  POOL.execute(() -> {
+                      try {
+                          t.run();
+                      } catch (Exception e) {
+                          status = "Gagal: " + e.getClass().getSimpleName() + " " + e.getMessage();
+                      }
+                  });
+              }
+
+              public static void upload(UUID u, byte[] png) {
+                  status = "Mengunggah cape...";
+                  async(() -> {
+                      HttpURLConnection c = open("/cape/" + u, "PUT");
+                      c.setDoOutput(true);
+                      c.setFixedLengthStreamingMode(png.length);
+                      c.setRequestProperty("Content-Type", "image/png");
+                      try (OutputStream o = c.getOutputStream()) {
+                          o.write(png);
+                      }
+                      int code = c.getResponseCode();
+                      status = code == 200 ? "Cape terkirim ke server"
+                              : "Gagal kirim (" + code + "): " + readSmall(code >= 400 ? c.getErrorStream() : c.getInputStream());
+                  });
+              }
+
+              public static void delete(UUID u) {
+                  async(() -> {
+                      HttpURLConnection c = open("/cape/" + u, "DELETE");
+                      int code = c.getResponseCode();
+                      status = code == 200 ? "Cape dihapus dari server"
+                              : "Gagal hapus (" + code + "): " + readSmall(code >= 400 ? c.getErrorStream() : c.getInputStream());
+                  });
+              }
+
+              /** Ambil cape pemain lain. Callback dipanggil dari thread jaringan. */
+              public static void fetch(UUID u, String etag, Consumer<Result> cb) {
+                  POOL.execute(() -> {
+                      try {
+                          HttpURLConnection c = open("/cape/" + u, "GET");
+                          if (etag != null) c.setRequestProperty("If-None-Match", etag);
+                          int code = c.getResponseCode();
+                          String newTag = c.getHeaderField("ETag");
+                          if (code == 200) {
+                              try (InputStream in = c.getInputStream()) {
+                                  byte[] body = in.readNBytes(2_000_000);
+                                  cb.accept(new Result(200, body, newTag));
+                              }
+                          } else {
+                              cb.accept(new Result(code, null, newTag));
+                          }
+                      } catch (Exception e) {
+                          cb.accept(new Result(-1, null, null));
+                      }
+                  });
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientcapes/CapeSync.java <<'EOF'
+          package com.example.clientcapes;
+
+          import net.minecraft.client.MinecraftClient;
+
+          import java.util.UUID;
+
+          /** Mengunggah cape pilihanmu ke server saat masuk dunia atau setelah kamu menekan Select. */
+          public class CapeSync {
+              public static volatile boolean needUpload = false;
+              private static boolean joined = false;
+
+              public static void tick(MinecraftClient mc) {
+                  if (mc.player == null) {
+                      joined = false;
+                      return;
+                  }
+                  if (!joined) {
+                      joined = true;
+                      needUpload = true;
+                  }
+                  if (!needUpload) return;
+
+                  CapeConfig c = CapeConfig.get();
+                  needUpload = false;
+                  if (!CapeNet.enabled() || !c.shareOwn) return;
+
+                  UUID u = mc.player.getUuid();
+                  String key = c.capeKey;
+                  if (key == null || key.isEmpty()) {
+                      CapeNet.delete(u);
+                      return;
+                  }
+                  CapeData d = Capes.get(key);
+                  if (d == null) {
+                      CapeNet.status = "Cape yang dipilih tidak ditemukan";
+                      return;
+                  }
+                  try {
+                      byte[] png = Capes.toPng(d);
+                      if (png.length > 1_000_000) {
+                          CapeNet.status = "Cape terlalu besar (maks 1MB)";
+                          return;
+                      }
+                      CapeNet.upload(u, png);
+                  } catch (Exception e) {
+                      CapeNet.status = "Gagal menyiapkan cape: " + e.getMessage();
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientcapes/RemoteCapes.java <<'EOF'
+          package com.example.clientcapes;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.util.Identifier;
+
+          import java.util.Map;
+          import java.util.UUID;
+          import java.util.concurrent.ConcurrentHashMap;
+
+          /** Menyimpan cape pemain lain yang diambil dari server. */
+          public class RemoteCapes {
+              private static class St {
+                  volatile Identifier id;
+                  volatile String etag;
+                  volatile long lastCheck;
+                  volatile boolean inFlight;
+                  volatile boolean ready;
+              }
+
+              private static final Map<UUID, St> MAP = new ConcurrentHashMap<>();
+              private static final long RECHECK_MS = 120_000L;
+
+              public static void reset() {
+                  MAP.clear();
+              }
+
+              /** Mengembalikan id tekstur cape pemain ini, atau null bila belum ada. Memicu pengambilan data bila perlu. */
+              public static Identifier idFor(UUID u) {
+                  if (!CapeNet.enabled()) return null;
+                  St s = MAP.computeIfAbsent(u, k -> new St());
+                  long now = System.currentTimeMillis();
+                  if (!s.inFlight && now - s.lastCheck > RECHECK_MS) {
+                      s.inFlight = true;
+                      s.lastCheck = now;
+                      CapeNet.fetch(u, s.etag, res -> handle(u, s, res));
+                  }
+                  return s.ready ? s.id : null;
+              }
+
+              private static void handle(UUID u, St s, CapeNet.Result res) {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  mc.execute(() -> {
+                      try {
+                          if (res.code() == 200 && res.body() != null) {
+                              CapeData d = Capes.fromBytes(res.body());
+                              if (d != null) {
+                                  Identifier id = Identifier.of("clientcapes", "remote/" + u);
+                                  CapeManager.register(mc, id, d);
+                                  s.id = id;
+                                  s.etag = res.etag();
+                                  s.ready = true;
+                              }
+                          } else if (res.code() == 404) {
+                              s.ready = false;
+                              s.etag = null;
+                          }
+                          // 304 = tidak berubah, kode lain/gagal = coba lagi nanti
+                      } catch (Throwable t) {
+                          System.err.println("[ClientCapes] Gagal memuat cape pemain lain: " + t);
+                      } finally {
+                          s.inFlight = false;
+                      }
+                  });
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientcapes/CapeManager.java <<'EOF'
+          package com.example.clientcapes;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.texture.AbstractTexture;
+          import net.minecraft.client.texture.NativeImage;
+          import net.minecraft.client.texture.NativeImageBackedTexture;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.util.Identifier;
+
+          import java.lang.reflect.Constructor;
+          import java.lang.reflect.Method;
+          import java.lang.reflect.RecordComponent;
+          import java.util.Arrays;
+          import java.util.HashMap;
+          import java.util.Map;
+          import java.util.UUID;
+          import java.util.function.Supplier;
+
+          /**
+           * Mengganti tekstur cape pemain (kamu sendiri dan pemain lain yang punya cape di server).
+           * Pembuatan objek SkinTextures dilakukan lewat refleksi pada record-nya, sehingga tidak
+           * bergantung pada nama class yang berubah antar versi.
+           */
+          public class CapeManager {
+              public static final Identifier ID = Identifier.of("clientcapes", "cape/active");
+
+              private static String loadedKey = null;
+              private static boolean active = false;
+              private static boolean warned = false;
+              private static final Map<UUID, Object[]> CACHE = new HashMap<>();
+
+              public static void invalidate() {
+                  loadedKey = null;
+              }
+
+              private static AbstractTexture makeTexture(NativeImage img) throws Exception {
+                  for (Constructor<?> k : NativeImageBackedTexture.class.getConstructors()) {
+                      Class<?>[] p = k.getParameterTypes();
+                      if (p.length == 1 && p[0] == NativeImage.class) {
+                          return (AbstractTexture) k.newInstance(img);
+                      }
+                  }
+                  for (Constructor<?> k : NativeImageBackedTexture.class.getConstructors()) {
+                      Class<?>[] p = k.getParameterTypes();
+                      if (p.length == 2 && p[1] == NativeImage.class) {
+                          if (p[0] == Supplier.class) {
+                              Supplier<String> name = () -> "clientcapes cape";
+                              return (AbstractTexture) k.newInstance(name, img);
+                          }
+                          if (p[0] == String.class) {
+                              return (AbstractTexture) k.newInstance("clientcapes cape", img);
+                          }
+                      }
+                  }
+                  throw new IllegalStateException("Konstruktor NativeImageBackedTexture tidak cocok");
+              }
+
+              /** Daftarkan tekstur cape ke TextureManager dengan id tertentu (harus di render thread). */
+              public static void register(MinecraftClient mc, Identifier id, CapeData d) throws Exception {
+                  NativeImage img = new NativeImage(NativeImage.Format.RGBA, d.w, d.h, false);
+                  for (int y = 0; y < d.h; y++) {
+                      for (int x = 0; x < d.w; x++) {
+                          img.setColorArgb(x, y, d.px[y * d.w + x]);
+                      }
+                  }
+                  AbstractTexture tex = makeTexture(img);
+                  try {
+                      Method up = tex.getClass().getMethod("upload");
+                      up.invoke(tex);
+                  } catch (Throwable ignored) {
+                  }
+                  mc.getTextureManager().registerTexture(id, tex);
+              }
+
+              private static void ensureLoaded(MinecraftClient mc) {
+                  String key = CapeConfig.get().capeKey;
+                  if (key == null) key = "";
+                  if (key.equals(loadedKey)) return;
+
+                  loadedKey = key;
+                  active = false;
+                  if (key.isEmpty()) return;
+
+                  CapeData d = Capes.get(key);
+                  if (d == null) return;
+                  try {
+                      register(mc, ID, d);
+                      active = true;
+                  } catch (Throwable t) {
+                      System.err.println("[ClientCapes] Gagal memuat cape: " + t);
+                  }
+              }
+
+              private static Object makeAsset(Class<?> type, Object body, Identifier id) throws Exception {
+                  if (type == Identifier.class) return id;
+                  Class<?> bc = body.getClass();
+                  for (Constructor<?> k : bc.getDeclaredConstructors()) {
+                      Class<?>[] p = k.getParameterTypes();
+                      boolean all = p.length > 0;
+                      for (Class<?> q : p) {
+                          if (q != Identifier.class) all = false;
+                      }
+                      if (all) {
+                          k.setAccessible(true);
+                          Object[] a = new Object[p.length];
+                          Arrays.fill(a, id);
+                          return k.newInstance(a);
+                      }
+                  }
+                  throw new IllegalStateException("Konstruktor asset tidak ditemukan");
+              }
+
+              private static Object build(Object original, Identifier id) {
+                  try {
+                      Class<?> c = original.getClass();
+                      RecordComponent[] rc = c.getRecordComponents();
+                      if (rc == null || rc.length < 3) return null;
+
+                      Object[] vals = new Object[rc.length];
+                      Class<?>[] types = new Class<?>[rc.length];
+                      for (int i = 0; i < rc.length; i++) {
+                          Method m = rc[i].getAccessor();
+                          m.setAccessible(true);
+                          vals[i] = m.invoke(original);
+                          types[i] = rc[i].getType();
+                      }
+
+                      // Komponen bertipe sama dengan komponen pertama: [0]=badan, [1]=cape, [2]=elytra
+                      Class<?> t0 = types[0];
+                      int seen = 0, capeIdx = -1, elyIdx = -1;
+                      for (int i = 0; i < rc.length; i++) {
+                          if (types[i] == t0) {
+                              if (seen == 1) capeIdx = i;
+                              else if (seen == 2) elyIdx = i;
+                              seen++;
+                          }
+                      }
+                      if (capeIdx < 0) return null;
+
+                      vals[capeIdx] = makeAsset(t0, vals[0], id);
+                      if (elyIdx >= 0) vals[elyIdx] = makeAsset(t0, vals[0], id);
+
+                      Constructor<?> k = c.getDeclaredConstructor(types);
+                      k.setAccessible(true);
+                      return k.newInstance(vals);
+                  } catch (Throwable t) {
+                      if (!warned) {
+                          warned = true;
+                          System.err.println("[ClientCapes] Gagal menerapkan cape: " + t);
+                      }
+                      return null;
+                  }
+              }
+
+              /** Dipanggil dari mixin. Mengembalikan SkinTextures baru, atau null jika tidak diubah. */
+              public static Object override(Object self, Object original) {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  if (original == null || mc.player == null || !mc.isOnThread()) return null;
+                  if (!(self instanceof Entity e)) return null;
+
+                  Identifier id;
+                  if (e == mc.player) {
+                      ensureLoaded(mc);
+                      if (!active) return null;
+                      id = ID;
+                  } else {
+                      if (!CapeConfig.get().showOthers) return null;
+                      id = RemoteCapes.idFor(e.getUuid());
+                      if (id == null) return null;
+                  }
+
+                  UUID u = e.getUuid();
+                  Object[] c = CACHE.get(u);
+                  if (c != null && c[0] == original && id.equals(c[2])) return c[1];
+
+                  Object res = build(original, id);
+                  if (res != null) CACHE.put(u, new Object[]{original, res, id});
+                  return res;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientcapes/Ui.java <<'EOF'
+          package com.example.clientcapes;
+
+          import net.minecraft.client.gui.DrawContext;
+
+          public class Ui {
+              public static final int BG = 0xF0141420;
+              public static final int BORDER = 0xFF30304A;
+              public static final int PILL = 0xFFE0505E;
+              public static final int GREEN_BG = 0xFF2A4A35;
+              public static final int GREEN_BD = 0xFF4CAF50;
+
+              public static void border(DrawContext c, int x, int y, int w, int h, int col) {
+                  c.fill(x, y, x + w, y + 1, col);
+                  c.fill(x, y + h - 1, x + w, y + h, col);
+                  c.fill(x, y, x + 1, y + h, col);
+                  c.fill(x + w - 1, y, x + w, y + h, col);
+              }
+
+              public static void box(DrawContext c, int x, int y, int w, int h, int bg, int bd) {
+                  c.fill(x, y, x + w, y + h, bg);
+                  border(c, x, y, w, h, bd);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientcapes/Preview.java <<'EOF'
+          package com.example.clientcapes;
+
+          import net.minecraft.client.gui.DrawContext;
+
+          import java.util.ArrayList;
+          import java.util.Comparator;
+          import java.util.List;
+
+          /** Preview pemain + cape yang bisa diputar, digambar dengan kotak 2D (proyeksi ortografis sumbu Y). */
+          public class Preview {
+              private interface Tex {
+                  int at(double u, double v);
+              }
+
+              private record Job(double depth, Runnable run) {
+              }
+
+              private static int shade(int argb, double f) {
+                  int a = argb >>> 24;
+                  int r = Math.min(255, (int) (((argb >> 16) & 255) * f));
+                  int g = Math.min(255, (int) (((argb >> 8) & 255) * f));
+                  int b = Math.min(255, (int) ((argb & 255) * f));
+                  return (a << 24) | (r << 16) | (g << 8) | b;
+              }
+
+              private static Tex solid(int c) {
+                  return (u, v) -> c;
+              }
+
+              private static void face(List<Job> jobs, DrawContext ctx, double th, int cx, int baseY, float k,
+                                       double fcx, double fcz, double nx, double nz, double len,
+                                       double y0, double y1, Tex tex, int cols, int rows) {
+                  double c = Math.cos(th), s = Math.sin(th);
+                  double nzr = -nx * s + nz * c;
+                  if (nzr <= 0.01) return;
+
+                  double tx = nz, tz = -nx;
+                  double ax = fcx - tx * len, az = fcz - tz * len;
+                  double bx = fcx + tx * len, bz = fcz + tz * len;
+                  double xa = ax * c + az * s, xb = bx * c + bz * s;
+                  double depth = -fcx * s + fcz * c;
+                  double light = 0.6 + 0.4 * nzr;
+
+                  jobs.add(new Job(depth, () -> {
+                      for (int i = 0; i < cols; i++) {
+                          double u0 = (double) i / cols, u1 = (double) (i + 1) / cols;
+                          int sx0 = (int) Math.round(cx + (xa + (xb - xa) * u0) * k);
+                          int sx1 = (int) Math.round(cx + (xa + (xb - xa) * u1) * k);
+                          int lo = Math.min(sx0, sx1), hi = Math.max(sx0, sx1);
+                          if (lo == hi) continue;
+                          for (int j = 0; j < rows; j++) {
+                              double v0 = (double) j / rows, v1 = (double) (j + 1) / rows;
+                              int sy0 = (int) Math.round(baseY - (y1 - (y1 - y0) * v0) * k);
+                              int sy1 = (int) Math.round(baseY - (y1 - (y1 - y0) * v1) * k);
+                              int col = tex.at((u0 + u1) / 2, (v0 + v1) / 2);
+                              if ((col >>> 24) < 128) continue;
+                              ctx.fill(lo, sy0, hi, sy1, shade(col, light));
+                          }
+                      }
+                  }));
+              }
+
+              private static void box(List<Job> jobs, DrawContext ctx, double th, int cx, int baseY, float k,
+                                      double xc, double zc, double hx, double hz, double y0, double y1,
+                                      Tex front, int fc, int fr, Tex back, int bc, int br, Tex side, int sc, int sr) {
+                  face(jobs, ctx, th, cx, baseY, k, xc, zc + hz, 0, 1, hx, y0, y1, front, fc, fr);
+                  face(jobs, ctx, th, cx, baseY, k, xc, zc - hz, 0, -1, hx, y0, y1, back, bc, br);
+                  face(jobs, ctx, th, cx, baseY, k, xc + hx, zc, 1, 0, hz, y0, y1, side, sc, sr);
+                  face(jobs, ctx, th, cx, baseY, k, xc - hx, zc, -1, 0, hz, y0, y1, side, sc, sr);
+              }
+
+              public static void draw(DrawContext ctx, int cx, int baseY, float k, double angleDeg,
+                                      CapeData cape, boolean elytra) {
+                  double th = Math.toRadians(angleDeg);
+                  List<Job> jobs = new ArrayList<>();
+
+                  final int SKIN = 0xFFC6916A, HAIR = 0xFF3A2A1A, SHIRT = 0xFF2CA6A6, PANTS = 0xFF3B4A9C;
+
+                  Tex headFront = (u, v) -> {
+                      int gx = (int) (u * 8), gy = (int) (v * 8);
+                      if (gy < 2) return HAIR;
+                      if (gy == 4) {
+                          if (gx == 1 || gx == 6) return 0xFFFFFFFF;
+                          if (gx == 2 || gx == 5) return 0xFF3A3AA0;
+                      }
+                      if (gy == 6 && (gx == 3 || gx == 4)) return 0xFF8B5A3C;
+                      return SKIN;
+                  };
+                  Tex headSide = (u, v) -> v < 0.25 ? HAIR : SKIN;
+                  Tex arm = (u, v) -> v < 0.3 ? SHIRT : SKIN;
+
+                  // kaki
+                  box(jobs, ctx, th, cx, baseY, k, -2, 0, 2, 2, 0, 12,
+                          solid(PANTS), 1, 1, solid(PANTS), 1, 1, solid(PANTS), 1, 1);
+                  box(jobs, ctx, th, cx, baseY, k, 2, 0, 2, 2, 0, 12,
+                          solid(PANTS), 1, 1, solid(PANTS), 1, 1, solid(PANTS), 1, 1);
+                  // badan
+                  box(jobs, ctx, th, cx, baseY, k, 0, 0, 4, 2, 12, 24,
+                          solid(SHIRT), 1, 1, solid(SHIRT), 1, 1, solid(SHIRT), 1, 1);
+                  // tangan
+                  box(jobs, ctx, th, cx, baseY, k, -6, 0, 2, 2, 12, 24, arm, 1, 4, arm, 1, 4, arm, 1, 4);
+                  box(jobs, ctx, th, cx, baseY, k, 6, 0, 2, 2, 12, 24, arm, 1, 4, arm, 1, 4, arm, 1, 4);
+                  // kepala
+                  box(jobs, ctx, th, cx, baseY, k, 0, 0, 4, 4, 24, 32,
+                          headFront, 8, 8, solid(HAIR), 1, 1, headSide, 8, 8);
+
+                  if (!elytra && cape != null) {
+                      final CapeData cd = cape;
+                      Tex outer = (u, v) -> cd.sample(1 + u * 10, 1 + v * 16);
+                      box(jobs, ctx, th, cx, baseY, k, 0, -2.6, 5, 0.5, 8, 24,
+                              solid(shade(cd.avg, 0.7)), 1, 1, outer, 10, 16, solid(cd.avg), 1, 1);
+                  }
+
+                  if (elytra) {
+                      for (int sign = -1; sign <= 1; sign += 2) {
+                          final boolean mirror = sign > 0;
+                          final CapeData cd = cape;
+                          Tex outer;
+                          Tex inner;
+                          Tex side;
+                          if (cd == null) {
+                              outer = solid(0xFF9AA0A8);
+                              inner = solid(0xFF6E737A);
+                              side = solid(0xFF8A8F96);
+                          } else {
+                              outer = (u, v) -> cd.sample(24 + (mirror ? 1 - u : u) * 10, 2 + v * 20);
+                              inner = solid(shade(cd.avg, 0.7));
+                              side = solid(cd.avg);
+                          }
+                          box(jobs, ctx, th, cx, baseY, k, sign * 5, -2.7, 4.5, 0.5, 4, 24,
+                                  inner, 1, 1, outer, 10, 20, side, 1, 1);
+                      }
+                  }
+
+                  jobs.sort(Comparator.comparingDouble(Job::depth));
+                  ctx.fill(cx - 36, baseY, cx + 36, baseY + 1, 0x55FFFFFF);
+                  for (Job j : jobs) j.run().run();
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientcapes/NetScreen.java <<'EOF'
+          package com.example.clientcapes;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.TextFieldWidget;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Formatting;
+
+          public class NetScreen extends Screen {
+              private int px, py, pw, ph;
+              private TextFieldWidget urlF, keyF;
+
+              public NetScreen() {
+                  super(Text.literal("Server"));
+              }
+
+              private static Text onOff(String name, boolean on) {
+                  return Text.literal(name + ": ")
+                          .append(Text.literal(on ? "ON" : "OFF").formatted(on ? Formatting.GREEN : Formatting.RED));
+              }
+
+              @Override
+              protected void init() {
+                  pw = Math.min(this.width - 16, 320);
+                  ph = Math.min(this.height - 16, 216);
+                  px = (this.width - pw) / 2;
+                  py = (this.height - ph) / 2;
+                  CapeConfig c = CapeConfig.get();
+
+                  urlF = new TextFieldWidget(this.textRenderer, px + 12, py + 46, pw - 24, 18, Text.literal("URL"));
+                  urlF.setMaxLength(200);
+                  urlF.setPlaceholder(Text.literal("https://server-kamu.example.com"));
+                  urlF.setText(c.serverUrl);
+                  addDrawableChild(urlF);
+
+                  keyF = new TextFieldWidget(this.textRenderer, px + 12, py + 82, pw - 24, 18, Text.literal("Key"));
+                  keyF.setMaxLength(64);
+                  keyF.setPlaceholder(Text.literal("Kunci bersama (sama dengan server)"));
+                  keyF.setText(c.serverKey);
+                  addDrawableChild(keyF);
+
+                  addDrawableChild(ButtonWidget.builder(onOff("Lihat cape pemain lain", c.showOthers), b -> {
+                      c.showOthers = !c.showOthers;
+                      CapeConfig.save();
+                      b.setMessage(onOff("Lihat cape pemain lain", c.showOthers));
+                  }).dimensions(px + 12, py + 108, pw - 24, 20).build());
+
+                  addDrawableChild(ButtonWidget.builder(onOff("Bagikan cape-ku", c.shareOwn), b -> {
+                      c.shareOwn = !c.shareOwn;
+                      CapeConfig.save();
+                      b.setMessage(onOff("Bagikan cape-ku", c.shareOwn));
+                  }).dimensions(px + 12, py + 132, pw - 24, 20).build());
+
+                  int half = (pw - 30) / 2;
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Simpan & Kirim Ulang"), b -> {
+                      c.serverUrl = urlF.getText().trim();
+                      c.serverKey = keyF.getText().trim();
+                      CapeConfig.save();
+                      RemoteCapes.reset();
+                      CapeSync.needUpload = true;
+                      CapeNet.status = CapeNet.enabled()
+                              ? "Tersimpan. Cape dikirim saat kamu berada di dunia."
+                              : "URL server kosong.";
+                  }).dimensions(px + 12, py + 160, half, 20).build());
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Kembali"),
+                          b -> this.client.setScreen(new CapeScreen()))
+                          .dimensions(px + 18 + half, py + 160, half, 20).build());
+              }
+
+              @Override
+              public void renderBackground(DrawContext c, int mx, int my, float d) {
+                  super.renderBackground(c, mx, my, d);
+                  Ui.box(c, px, py, pw, ph, Ui.BG, Ui.BORDER);
+              }
+
+              @Override
+              public void render(DrawContext c, int mx, int my, float d) {
+                  super.render(c, mx, my, d);
+                  c.fill(px + 10, py + 8, px + 140, py + 28, Ui.PILL);
+                  c.drawCenteredTextWithShadow(this.textRenderer, Text.literal("Server Cape"), px + 75, py + 14, 0xFFFFFFFF);
+                  c.drawTextWithShadow(this.textRenderer, Text.literal("URL Server"), px + 12, py + 34, 0xFFFFFFFF);
+                  c.drawTextWithShadow(this.textRenderer, Text.literal("Kunci Server (opsional)"), px + 12, py + 70, 0xFFFFFFFF);
+                  String st = CapeNet.status == null ? "" : CapeNet.status;
+                  c.drawTextWithShadow(this.textRenderer,
+                          Text.literal(this.textRenderer.trimToWidth(st, pw - 24)), px + 12, py + ph - 26, 0xFFFFDD66);
+                  c.drawTextWithShadow(this.textRenderer,
+                          Text.literal(this.textRenderer.trimToWidth("Semua teman harus pakai URL dan kunci yang sama.", pw - 24)),
+                          px + 12, py + ph - 14, 0xFF9999AA);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientcapes/CapeScreen.java <<'EOF'
+          package com.example.clientcapes;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.text.Text;
+          import org.lwjgl.glfw.GLFW;
+
+          import java.io.IOException;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.nio.file.StandardCopyOption;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class CapeScreen extends Screen {
+              private static final int PER_PAGE = 9;
+              private static String pending = null;
+              private static int page = 0;
+
+              private int px, py, pw, ph, pvx, pvy, pvw, pvh, cx0, tw, th;
+              private boolean elytra = false;
+              private float angle = 205f;
+              private boolean dragging;
+              private int lastMx;
+              private long lastNano;
+              private String status = "";
+              private long statusUntil;
+
+              private List<Capes.Entry> entries = new ArrayList<>();
+              private final List<ButtonWidget> tileBtns = new ArrayList<>();
+              private final List<Capes.Entry> tileEntries = new ArrayList<>();
+              private ButtonWidget tabNo, tabEly, selectBtn, spinBtn, prevBtn, nextBtn, refreshBtn, serverBtn;
+
+              public CapeScreen() {
+                  super(Text.literal("Cape Menu"));
+              }
+
+              private int maxPage() {
+                  return Math.max(0, (entries.size() - 1) / PER_PAGE);
+              }
+
+              @Override
+              protected void init() {
+                  pw = Math.min(this.width - 16, 360);
+                  ph = Math.min(this.height - 16, 230);
+                  px = (this.width - pw) / 2;
+                  py = (this.height - ph) / 2;
+                  pvw = Math.min(162, pw / 2 - 10);
+                  pvx = px + 8;
+                  pvy = py + 34;
+                  pvh = ph - 68;
+                  cx0 = pvx + pvw + 6;
+                  int areaW = px + pw - 8 - cx0;
+                  tw = (areaW - 8) / 3;
+                  th = Math.max(40, (pvh - 8) / 3);
+                  lastNano = System.nanoTime();
+
+                  entries = Capes.entries();
+                  if (pending == null) pending = CapeConfig.get().capeKey;
+                  if (page > maxPage()) page = maxPage();
+
+                  tileBtns.clear();
+                  tileEntries.clear();
+                  for (int i = 0; i < PER_PAGE; i++) {
+                      int idx = page * PER_PAGE + i;
+                      if (idx >= entries.size()) break;
+                      Capes.Entry e = entries.get(idx);
+                      int x = cx0 + (i % 3) * (tw + 4);
+                      int y = pvy + (i / 3) * (th + 4);
+                      ButtonWidget b = ButtonWidget.builder(Text.empty(), btn -> pending = e.key())
+                              .dimensions(x, y, tw, th).build();
+                      addDrawableChild(b);
+                      tileBtns.add(b);
+                      tileEntries.add(e);
+                  }
+
+                  int by = pvy + pvh + 4;
+                  tabNo = ButtonWidget.builder(Text.empty(), b -> elytra = false)
+                          .dimensions(pvx, by, pvw / 2 - 2, 18).build();
+                  tabEly = ButtonWidget.builder(Text.empty(), b -> elytra = true)
+                          .dimensions(pvx + pvw / 2 + 2, by, pvw / 2 - 2, 18).build();
+                  addDrawableChild(tabNo);
+                  addDrawableChild(tabEly);
+
+                  prevBtn = ButtonWidget.builder(Text.empty(), b -> {
+                      if (page > 0) {
+                          page--;
+                          this.client.setScreen(new CapeScreen());
+                      }
+                  }).dimensions(cx0, by, 26, 18).build();
+                  nextBtn = ButtonWidget.builder(Text.empty(), b -> {
+                      if (page < maxPage()) {
+                          page++;
+                          this.client.setScreen(new CapeScreen());
+                      }
+                  }).dimensions(cx0 + 30, by, 26, 18).build();
+                  refreshBtn = ButtonWidget.builder(Text.empty(), b -> {
+                      Capes.clearCache();
+                      this.client.setScreen(new CapeScreen());
+                  }).dimensions(cx0 + 60, by, 56, 18).build();
+                  addDrawableChild(prevBtn);
+                  addDrawableChild(nextBtn);
+                  addDrawableChild(refreshBtn);
+
+                  selectBtn = ButtonWidget.builder(Text.empty(), b -> {
+                      CapeConfig.get().capeKey = pending == null ? "" : pending;
+                      CapeConfig.save();
+                      CapeSync.needUpload = true;
+                      status = CapeNet.enabled() && CapeConfig.get().shareOwn
+                              ? "Cape diterapkan & dikirim" : "Cape diterapkan!";
+                      statusUntil = System.currentTimeMillis() + 2500;
+                  }).dimensions(pvx + pvw - 54, pvy + pvh - 22, 50, 18).build();
+                  spinBtn = ButtonWidget.builder(Text.empty(), b -> {
+                      CapeConfig.get().autoSpin = !CapeConfig.get().autoSpin;
+                      CapeConfig.save();
+                  }).dimensions(pvx + pvw - 46, pvy + 4, 42, 14).build();
+                  addDrawableChild(selectBtn);
+                  addDrawableChild(spinBtn);
+
+                  serverBtn = ButtonWidget.builder(Text.empty(), b -> this.client.setScreen(new NetScreen()))
+                          .dimensions(px + pw - 76, py + 8, 68, 20).build();
+                  addDrawableChild(serverBtn);
+              }
+
+              /** Drag & drop file PNG ke layar ini untuk menambah cape custom. */
+              public void onFilesDropped(List<Path> paths) {
+                  int n = 0;
+                  for (Path p : paths) {
+                      String name = p.getFileName().toString();
+                      if (!name.toLowerCase().endsWith(".png")) continue;
+                      try {
+                          Files.createDirectories(Capes.dir());
+                          String safe = name.replaceAll("[^A-Za-z0-9._ -]", "_");
+                          Files.copy(p, Capes.dir().resolve(safe), StandardCopyOption.REPLACE_EXISTING);
+                          n++;
+                      } catch (IOException e) {
+                          e.printStackTrace();
+                      }
+                  }
+                  if (n > 0) {
+                      Capes.clearCache();
+                      this.client.setScreen(new CapeScreen());
+                  }
+              }
+
+              @Override
+              public void renderBackground(DrawContext c, int mx, int my, float d) {
+                  super.renderBackground(c, mx, my, d);
+                  Ui.box(c, px, py, pw, ph, Ui.BG, Ui.BORDER);
+              }
+
+              private void overlay(DrawContext c, ButtonWidget b, String text, int bg, int bd) {
+                  Ui.box(c, b.getX(), b.getY(), b.getWidth(), b.getHeight(), bg, bd);
+                  if (b.isHovered()) {
+                      c.fill(b.getX() + 1, b.getY() + 1, b.getX() + b.getWidth() - 1,
+                              b.getY() + b.getHeight() - 1, 0x22FFFFFF);
+                  }
+                  c.drawCenteredTextWithShadow(this.textRenderer, Text.literal(text),
+                          b.getX() + b.getWidth() / 2, b.getY() + (b.getHeight() - 8) / 2, 0xFFFFFFFF);
+              }
+
+              private String nameOf(String key) {
+                  for (Capes.Entry e : entries) {
+                      if (e.key().equals(key)) return e.name();
+                  }
+                  return "?";
+              }
+
+              private void drawMini(DrawContext c, int x, int y, CapeData cd) {
+                  for (int j = 0; j < 16; j++) {
+                      for (int i = 0; i < 10; i++) {
+                          int col = cd.sample(1 + i + 0.5, 1 + j + 0.5);
+                          if ((col >>> 24) < 128) continue;
+                          c.fill(x + i * 2, y + j * 2, x + i * 2 + 2, y + j * 2 + 2, col | 0xFF000000);
+                      }
+                  }
+              }
+
+              @Override
+              public void render(DrawContext c, int mx, int my, float d) {
+                  super.render(c, mx, my, d);
+
+                  // header
+                  c.fill(px + 10, py + 8, px + 140, py + 28, Ui.PILL);
+                  c.drawCenteredTextWithShadow(this.textRenderer, Text.literal("Cape Menu"), px + 75, py + 14, 0xFFFFFFFF);
+                  String net = CapeNet.status == null ? "" : CapeNet.status;
+                  if (!net.isEmpty()) {
+                      c.drawTextWithShadow(this.textRenderer,
+                              Text.literal(this.textRenderer.trimToWidth(net, pw - 76 - 150)),
+                              px + 146, py + 14, 0xFFFFDD66);
+                  }
+                  overlay(c, serverBtn, "Server", CapeNet.enabled() ? Ui.GREEN_BG : 0xFF22222F,
+                          CapeNet.enabled() ? Ui.GREEN_BD : Ui.BORDER);
+
+                  // area preview
+                  Ui.box(c, pvx, pvy, pvw, pvh, 0xFF101018, Ui.BORDER);
+
+                  // rotasi: drag mouse di area preview + putar otomatis
+                  long now = System.nanoTime();
+                  double dt = Math.min(0.1, (now - lastNano) / 1e9);
+                  lastNano = now;
+                  boolean down = GLFW.glfwGetMouseButton(this.client.getWindow().getHandle(),
+                          GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
+                  boolean inPreview = mx >= pvx && mx < pvx + pvw && my >= pvy && my < pvy + pvh;
+                  if (down) {
+                      if (!dragging && inPreview && !selectBtn.isHovered() && !spinBtn.isHovered()) {
+                          dragging = true;
+                          lastMx = mx;
+                      } else if (dragging) {
+                          angle += (mx - lastMx) * 1.3f;
+                          lastMx = mx;
+                      }
+                  } else {
+                      dragging = false;
+                  }
+                  if (!dragging && CapeConfig.get().autoSpin) angle += (float) (dt * 25.0);
+
+                  CapeData cd = (pending == null || pending.isEmpty()) ? null : Capes.get(pending);
+                  float k = Math.max(2f, (pvh - 24) / 34f);
+                  Preview.draw(c, pvx + pvw / 2, pvy + pvh - 14, k, angle, cd, elytra);
+
+                  c.drawTextWithShadow(this.textRenderer,
+                          Text.literal(this.textRenderer.trimToWidth(nameOf(pending), pvw - 56)),
+                          pvx + 5, pvy + 6, 0xFFFFFFFF);
+                  if (System.currentTimeMillis() < statusUntil) {
+                      c.drawTextWithShadow(this.textRenderer, Text.literal(status), pvx + 5, pvy + 18, 0xFF55FF55);
+                  }
+
+                  // tombol di preview
+                  overlay(c, spinBtn, "Putar", CapeConfig.get().autoSpin ? Ui.GREEN_BG : 0xFF22222F,
+                          CapeConfig.get().autoSpin ? Ui.GREEN_BD : Ui.BORDER);
+                  String active = CapeConfig.get().capeKey;
+                  boolean same = (pending == null ? "" : pending).equals(active);
+                  overlay(c, selectBtn, same ? "Dipakai" : "Select", same ? 0xFF22222F : Ui.GREEN_BG,
+                          same ? Ui.BORDER : Ui.GREEN_BD);
+
+                  // tab elytra
+                  overlay(c, tabNo, "Tanpa Elytra", !elytra ? 0xFF3A3A5A : 0xFF22222F, !elytra ? Ui.PILL : Ui.BORDER);
+                  overlay(c, tabEly, "Pakai Elytra", elytra ? 0xFF3A3A5A : 0xFF22222F, elytra ? Ui.PILL : Ui.BORDER);
+
+                  // daftar cape
+                  for (int i = 0; i < tileBtns.size(); i++) {
+                      ButtonWidget b = tileBtns.get(i);
+                      Capes.Entry e = tileEntries.get(i);
+                      boolean sel = e.key().equals(pending == null ? "" : pending);
+                      boolean act = e.key().equals(active);
+                      Ui.box(c, b.getX(), b.getY(), b.getWidth(), b.getHeight(),
+                              sel ? 0xFF3A2A32 : 0xFF22222F, act ? Ui.GREEN_BD : (sel ? Ui.PILL : Ui.BORDER));
+                      if (b.isHovered()) {
+                          c.fill(b.getX() + 1, b.getY() + 1, b.getX() + b.getWidth() - 1,
+                                  b.getY() + b.getHeight() - 1, 0x22FFFFFF);
+                      }
+                      int mx0 = b.getX() + (b.getWidth() - 20) / 2;
+                      CapeData mini = e.key().isEmpty() ? null : Capes.get(e.key());
+                      if (mini != null) {
+                          drawMini(c, mx0, b.getY() + 3, mini);
+                      } else {
+                          c.drawCenteredTextWithShadow(this.textRenderer, Text.literal(e.key().isEmpty() ? "-" : "?"),
+                                  b.getX() + b.getWidth() / 2, b.getY() + 14, 0xFFAAAAAA);
+                      }
+                      String nm = this.textRenderer.trimToWidth(e.name(), b.getWidth() - 4);
+                      c.drawCenteredTextWithShadow(this.textRenderer, Text.literal(nm),
+                              b.getX() + b.getWidth() / 2, b.getY() + b.getHeight() - 11, 0xFFFFFFFF);
+                  }
+
+                  // navigasi
+                  overlay(c, prevBtn, "<", 0xFF22222F, Ui.BORDER);
+                  overlay(c, nextBtn, ">", 0xFF22222F, Ui.BORDER);
+                  overlay(c, refreshBtn, "Refresh", 0xFF22222F, Ui.BORDER);
+                  c.drawTextWithShadow(this.textRenderer, Text.literal((page + 1) + "/" + (maxPage() + 1)),
+                          cx0 + 122, pvy + pvh + 9, 0xFFFFFFFF);
+
+                  // petunjuk folder
+                  String hint = "Taruh PNG di: " + Capes.dir() + "  (atau drag & drop file ke sini)";
+                  c.drawTextWithShadow(this.textRenderer,
+                          Text.literal(this.textRenderer.trimToWidth(hint, pw - 16)), px + 8, py + ph - 12, 0xFF9999AA);
+              }
+          }
+          EOF
+
+      - name: Build
+        working-directory: mod
+        run: gradle build --no-daemon
+
+      - name: Upload mod jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: clientcapes-1.21.11
+          path: |
+            mod/build/libs/*.jar
+            !mod/build/libs/*-sources.jar
+
+      - name: Upload cape server
+        uses: actions/upload-artifact@v4
+        with:
+          name: cape-server
+          path: cape_server.py
